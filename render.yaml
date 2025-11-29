@@ -1,6 +1,7 @@
 services:
   - type: web
-    name: mega-agency-bridge-advanced
+    name: mega-agency-bridge
     env: docker
     plan: free
     autoDeploy: true
+
