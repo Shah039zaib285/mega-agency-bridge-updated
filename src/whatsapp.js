@@ -1,125 +1,88 @@
+// Minimal, reliable Baileys integration + forward to n8n + send API
+import baileys from "@whiskeysockets/baileys";
 import qrcodeTerminal from "qrcode-terminal";
-import * as baileys from "@whiskeysockets/baileys";
-
-import logger from "./logger.js";
+import fs from "fs";
+import fetch from "node-fetch";
 import config from "./config.js";
-import { restoreLatest } from "./restore.js";
-import { saveBackupToDb } from "./middleware/backup.js";
-import { setLatestQr } from "./routes/adminQr.js";
+import logger from "./logger.js";
 
-const {
-  makeWASocket,
-  useMultiFileAuthState,
-  fetchLatestBaileysVersion,
-  DisconnectReason,
-  Browsers
-} = baileys;
+const { default: makeWASocket, useMultiFileAuthState } = baileys;
 
 let sock = null;
-let ioRef = null;
-
-const SESSION_ID = "default";
-
-export function attachIo(io) {
-  ioRef = io;
-}
+let status = { connected: false, lastDisconnect: null };
 
 export function getStatus() {
-  return {
-    connected: !!(sock && sock.user),
-    lastDisconnect: null,
-    error: null
-  };
+  return status;
 }
 
 export async function startWhatsApp() {
   try {
-    if (config.dbUrl && config.authEncKey) {
-      await restoreLatest(SESSION_ID, false);
-    } else {
-      logger.info("DB or AUTH_ENC_KEY not set - skipping auto-restore");
-    }
+    const authFolder = "./auth";
+    if (!fs.existsSync(authFolder)) fs.mkdirSync(authFolder);
+
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: true,
+      // browser: Browsers.macOS("Safari") // optional
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("connection.update", (u) => {
+      const { connection, lastDisconnect, qr } = u;
+      if (qr) {
+        logger.info("QR RECEIVED");
+        qrcodeTerminal.generate(qr, { small: true });
+      }
+      if (connection === "open") {
+        status = { connected: true, lastDisconnect: null };
+        logger.info("WhatsApp connected");
+      } else if (connection === "close") {
+        status = { connected: false, lastDisconnect };
+        logger.warn("WhatsApp disconnected", lastDisconnect || {});
+        // attempt reconnect handled externally by process restart or you can call startWhatsApp() with backoff
+      }
+    });
+
+    sock.ev.on("messages.upsert", async (m) => {
+      try {
+        const msgs = m.messages || [];
+        for (const msg of msgs) {
+          if (!msg.message || msg.key?.fromMe) continue;
+          const from = msg.key.remoteJid;
+          const body = msg.message.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            null;
+
+          logger.info({ from, body }, "Incoming message");
+
+          // forward to n8n if configured
+          if (config.n8nWebhook) {
+            fetch(config.n8nWebhook, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ from, body, timestamp: Date.now() })
+            }).catch((e) => logger.warn("Forward to n8n failed", e?.message));
+          }
+        }
+      } catch (e) {
+        logger.error(e, "messages.upsert handler error");
+      }
+    });
+
+    return sock;
   } catch (err) {
-    logger.error({ err }, "Auto-restore failed, continuing without restored auth");
+    logger.error(err, "startWhatsApp error");
+    throw err;
   }
-
-  const { version } = await fetchLatestBaileysVersion();
-  const { state, saveCreds } = await useMultiFileAuthState("auth");
-
-  sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.macOS("Safari")
-  });
-
-  sock.ev.on("creds.update", async () => {
-    try {
-      await saveCreds();
-      if (config.dbUrl && config.authEncKey) {
-        await saveBackupToDb(SESSION_ID);
-      }
-    } catch (err) {
-      logger.error({ err }, "Error during creds.update backup");
-    }
-  });
-
-  sock.ev.on("connection.update", (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      logger.info("QR RECEIVED - scan this from WhatsApp");
-      qrcodeTerminal.generate(qr, { small: true });
-      setLatestQr(qr);
-      if (ioRef) ioRef.emit("whatsapp:qr", { qr });
-    }
-
-    if (connection === "open") {
-      logger.info("WhatsApp connection opened");
-      if (ioRef) ioRef.emit("whatsapp:connected");
-      setLatestQr(null);
-    } else if (connection === "close") {
-      logger.warn({ lastDisconnect }, "WhatsApp connection closed");
-      if (ioRef) ioRef.emit("whatsapp:disconnected", { lastDisconnect });
-
-      const reason = lastDisconnect?.error?.output?.statusCode || DisconnectReason.connectionClosed;
-
-      if (reason !== DisconnectReason.loggedOut) {
-        logger.warn("Reconnecting...");
-        startWhatsApp();
-      } else {
-        logger.error("Logged out — delete auth folder to re-login");
-      }
-    }
-  });
-
-  sock.ev.on("messages.upsert", async (m) => {
-    const upsertType = m.type;
-    const msgs = m.messages || [];
-    for (const msg of msgs) {
-      const from = msg.key.remoteJid;
-      const body =
-        (msg.message && msg.message.conversation) ||
-        (msg.message &&
-          msg.message.extendedTextMessage &&
-          msg.message.extendedTextMessage.text) ||
-        null;
-
-      logger.info({ from, body, upsertType }, "Incoming message");
-
-      if (ioRef) {
-        ioRef.emit("whatsapp:message", { from, body, upsertType });
-      }
-    }
-  });
-
-  return sock;
 }
 
 export async function sendTextMessage(jid, text) {
-  if (!sock) {
-    throw new Error("WhatsApp socket not ready");
-  }
-  const result = await sock.sendMessage(jid, { text });
-  return result;
+  if (!sock) throw new Error("WhatsApp socket not ready");
+  return sock.sendMessage(jid, { text });
 }
+
+// auto start at import is optional; we will call from server if needed
+startWhatsApp().catch((e) => logger.error(e, "startup error"));
